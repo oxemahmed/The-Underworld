@@ -6,6 +6,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const Game = require('./utils/gameLogic.js');
 const GangSystem = require('./utils/gangSystem.js');
+const SmartContractSystem = require('./utils/smartContracts.js'); // إضافة نظام العقود
 
 const app = express();
 app.use(cors());
@@ -19,6 +20,7 @@ let players = [];               // قائمة اللاعبين المسجلين
 let waitingPlayers = [];         // قائمة اللاعبين المنتظرين (للبحث عن مباراة)
 let activeGames = {};            // الألعاب النشطة (gameId -> Game object)
 const gangSystem = new GangSystem(); // نظام العصابات
+const contractSystem = new SmartContractSystem(); // نظام العقود الذكية
 
 // ========== إدارة ربط socketId بمعرف اللاعب ==========
 const socketToPlayer = new Map();   // socketId -> playerId
@@ -262,7 +264,6 @@ app.get('/api/profile', (req, res) => {
 // إنشاء عصابة جديدة
 app.post('/api/gangs/create', (req, res) => {
   const { playerId, gangName, playerName } = req.body;
-  // التحقق من وجود اللاعب
   const player = players.find(p => p.id === playerId);
   if (!player) {
     return res.status(404).json({ success: false, message: 'Player not found' });
@@ -330,6 +331,82 @@ app.post('/api/gangs/contribute', (req, res) => {
     player.money -= amount;
   }
   res.json(result);
+});
+
+// ========== مسارات العقود الذكية (Smart Contracts) ==========
+
+// إنشاء عقد جديد
+app.post('/api/contracts/create', (req, res) => {
+  const { playerId, contractData } = req.body;
+  const player = players.find(p => p.id === playerId);
+  if (!player) {
+    return res.status(404).json({ success: false, message: 'Player not found' });
+  }
+  // التحقق من وجود رصيد كافٍ للضمان
+  if (contractData.escrowAmount && player.money < contractData.escrowAmount) {
+    return res.json({ success: false, message: 'لا تملك المال الكافي للضمان' });
+  }
+  const result = contractSystem.createContract(playerId, contractData);
+  if (result.success && contractData.escrowAmount) {
+    player.money -= contractData.escrowAmount;
+  }
+  res.json(result);
+});
+
+// قبول عقد
+app.post('/api/contracts/accept', (req, res) => {
+  const { playerId, contractId } = req.body;
+  const result = contractSystem.acceptContract(contractId, playerId);
+  res.json(result);
+});
+
+// رفض عقد
+app.post('/api/contracts/reject', (req, res) => {
+  const { playerId, contractId } = req.body;
+  const result = contractSystem.rejectContract(contractId, playerId);
+  res.json(result);
+});
+
+// تنفيذ عقد (إثبات)
+app.post('/api/contracts/execute', (req, res) => {
+  const { playerId, contractId, proof } = req.body;
+  const result = contractSystem.executeContract(contractId, playerId, proof);
+  if (result.success && result.reward) {
+    const player = players.find(p => p.id === playerId);
+    if (player) player.money += result.reward;
+  }
+  res.json(result);
+});
+
+// إلغاء عقد
+app.post('/api/contracts/cancel', (req, res) => {
+  const { playerId, contractId } = req.body;
+  const result = contractSystem.cancelContract(contractId, playerId);
+  if (result.success) {
+    const contract = contractSystem.getContract(contractId);
+    if (contract && contract.escrow.amount > 0 && contract.creator === playerId) {
+      const player = players.find(p => p.id === playerId);
+      if (player) player.money += contract.escrow.amount;
+    }
+  }
+  res.json(result);
+});
+
+// الحصول على عقود لاعب معين
+app.get('/api/contracts/player/:playerId', (req, res) => {
+  const { filter } = req.query;
+  const contracts = contractSystem.getPlayerContracts(req.params.playerId, filter || 'all');
+  res.json(contracts);
+});
+
+// الحصول على تفاصيل عقد محدد
+app.get('/api/contracts/:contractId', (req, res) => {
+  const contract = contractSystem.getContract(req.params.contractId);
+  if (contract) {
+    res.json({ success: true, contract });
+  } else {
+    res.status(404).json({ success: false, message: 'Contract not found' });
+  }
 });
 
 // الصفحة الرئيسية

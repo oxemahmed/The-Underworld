@@ -2,14 +2,16 @@
 // The-Underworld - Game Logic Engine
 // ============================================
 // هذا الملف يحتوي على القواعد الأساسية للعبة
-// تم دمج نظام العصابات بالكامل
+// تم دمج نظام العصابات ونظام العقود الذكية
 // ============================================
 
 const GangSystem = require('./gangSystem.js');
+const SmartContractSystem = require('./smartContracts.js');
 
 class Game {
   constructor(player1Id, player2Id) {
-    this.gangSystem = new GangSystem(); // نظام العصابات
+    this.gangSystem = new GangSystem();          // نظام العصابات
+    this.contractSystem = new SmartContractSystem(); // نظام العقود الذكية
     this.players = {
       [player1Id]: this.createPlayer(player1Id),
       [player2Id]: this.createPlayer(player2Id)
@@ -40,7 +42,7 @@ class Game {
         }
       },
       activities: [],       // الأنشطة الحالية (مثل سرقة بنك، مهمة)
-      contracts: [],        // العقود المبرمة مع لاعبين آخرين
+      contracts: [],        // العقود المبرمة مع لاعبين آخرين (سيتم ملؤها من contractSystem)
       stats: {
         level: 1,
         xp: 0,
@@ -271,12 +273,92 @@ class Game {
     return result;
   }
 
-  // ========== دوال العقود (سيتم تطويرها لاحقاً) ==========
+  // ========== دوال العقود الذكية (Smart Contracts) ==========
 
-  // إنشاء عقد جديد (مبدئي)
-  createContract(playerId, targetPlayerId, terms) {
-    // TODO: تطوير نظام العقود الكامل
-    return { success: false, message: 'قيد التطوير' };
+  // إنشاء عقد جديد
+  createContract(playerId, contractData) {
+    const player = this.players[playerId];
+    if (!player) return { success: false, message: 'لاعب غير موجود' };
+
+    // التحقق من أن اللاعب لديه المال الكافي للضمان
+    if (contractData.escrowAmount && player.resources.money < contractData.escrowAmount) {
+      return { success: false, message: 'لا تملك المال الكافي للضمان' };
+    }
+
+    const result = this.contractSystem.createContract(playerId, contractData);
+    
+    if (result.success && contractData.escrowAmount) {
+      // خصم مبلغ الضمان من اللاعب
+      player.resources.money -= contractData.escrowAmount;
+      // يمكن إضافة العقد إلى قائمة عقود اللاعب إذا أردت
+    }
+
+    return result;
+  }
+
+  // قبول عقد
+  acceptContract(playerId, contractId) {
+    const player = this.players[playerId];
+    if (!player) return { success: false, message: 'لاعب غير موجود' };
+
+    const result = this.contractSystem.acceptContract(contractId, playerId);
+    
+    // إذا كان العقد يتطلب ضمان من الطرف الآخر (يمكن إضافة منطق خصم)
+    // if (result.success) { ... }
+
+    return result;
+  }
+
+  // رفض عقد
+  rejectContract(playerId, contractId) {
+    const player = this.players[playerId];
+    if (!player) return { success: false, message: 'لاعب غير موجود' };
+    return this.contractSystem.rejectContract(contractId, playerId);
+  }
+
+  // تنفيذ عقد (مثل إثبات اغتيال)
+  executeContract(playerId, contractId, proof) {
+    const player = this.players[playerId];
+    if (!player) return { success: false, message: 'لاعب غير موجود' };
+
+    const result = this.contractSystem.executeContract(contractId, playerId, proof);
+    
+    if (result.success) {
+      // معالجة المكافآت بناءً على نوع العقد
+      if (result.reward) {
+        player.resources.money += result.reward;
+        player.stats.xp += 200; // مكافأة خبرة للاغتيال
+        this.checkLevelUp(player);
+      }
+      if (result.payment) {
+        player.resources.money += result.payment;
+      }
+    }
+
+    return result;
+  }
+
+  // إلغاء عقد
+  cancelContract(playerId, contractId) {
+    const player = this.players[playerId];
+    if (!player) return { success: false, message: 'لاعب غير موجود' };
+
+    const result = this.contractSystem.cancelContract(contractId, playerId);
+    
+    if (result.success) {
+      // استرجاع الضمان إذا كان العقد لا يزال pending
+      const contract = this.contractSystem.getContract(contractId);
+      if (contract && contract.escrow.amount > 0 && contract.creator === playerId) {
+        player.resources.money += contract.escrow.amount;
+      }
+    }
+
+    return result;
+  }
+
+  // الحصول على عقود اللاعب
+  getPlayerContracts(playerId, filter = 'all') {
+    return this.contractSystem.getPlayerContracts(playerId, filter);
   }
 
   // ========== دوال إنهاء الدور والتحقق من الفائز ==========
@@ -336,6 +418,9 @@ class Game {
       gangInfo = this.gangSystem.getGangStats(player.gang.id);
     }
 
+    // الحصول على عقود اللاعب من نظام العقود (اختياري)
+    const playerContracts = this.contractSystem.getPlayerContracts(playerId);
+
     return {
       gameId: this.gameId,
       you: {
@@ -348,7 +433,7 @@ class Game {
         },
         stats: { ...player.stats },
         activities: [...player.activities],
-        contracts: [...player.contracts],
+        contracts: playerContracts,  // استخدام العقود من النظام
         jailed: player.jailed || false,
         jailTurns: player.jailTurns || 0,
         invitations: [...player.gangInvitations]
