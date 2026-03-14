@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const Game = require('./utils/gameLogic.js'); // استيراد منطق اللعبة
 
 const app = express();
 app.use(cors());
@@ -14,14 +15,136 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 // بيانات مؤقتة (سنستبدلها بقاعدة بيانات لاحقاً)
 let players = [];
+let waitingPlayers = []; // قائمة اللاعبين المنتظرين
+let activeGames = {}; // الألعاب النشطة (gameId -> Game object)
+
 const SECRET_KEY = 'your-secret-key-change-it'; // غيّر هذا بمفتاح سري قوي
 
-// WebSocket للاتصال المباشر
+// ========== WebSocket للاتصال المباشر ==========
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
 
+  // انضمام لاعب للبحث عن مباراة
+  socket.on('join-game', ({ playerId, playerName }) => {
+    console.log(`Player ${playerName} (${playerId}) is looking for a game`);
+    
+    // التحقق من وجود اللاعب في قائمة اللاعبين
+    const player = players.find(p => p.id === playerId);
+    if (!player) {
+      socket.emit('error', 'Player not found');
+      return;
+    }
+
+    // إذا كان هناك لاعب منتظر
+    if (waitingPlayers.length > 0) {
+      const opponent = waitingPlayers.shift(); // لاعب منتظر
+      const gameId = `game_${Date.now()}`;
+
+      // إنشاء غرفة للمباراة
+      socket.join(gameId);
+      io.sockets.sockets.get(opponent.socketId)?.join(gameId);
+
+      // إنشاء كائن اللعبة الجديد
+      const game = new Game(playerId, opponent.playerId);
+      game.startGame();
+      activeGames[gameId] = game;
+
+      // إرسال بداية المباراة لكل لاعب مع الحالة
+      io.to(opponent.socketId).emit('game-start', {
+        gameId,
+        opponent: player.username,
+        yourTurn: (game.turn === opponent.playerId),
+        state: game.getStateForPlayer(opponent.playerId)
+      });
+      
+      io.to(socket.id).emit('game-start', {
+        gameId,
+        opponent: opponent.playerName,
+        yourTurn: (game.turn === playerId),
+        state: game.getStateForPlayer(playerId)
+      });
+
+      console.log(`Game started: ${playerId} vs ${opponent.playerId}`);
+    } else {
+      // لا يوجد لاعب منتظر، نضيف هذا اللاعب إلى قائمة الانتظار
+      waitingPlayers.push({
+        socketId: socket.id,
+        playerId: playerId,
+        playerName: playerName
+      });
+      socket.emit('waiting', 'جاري البحث عن خصم...');
+    }
+  });
+
+  // تنفيذ نشاط إجرامي
+  socket.on('perform-crime', ({ gameId, crimeType }) => {
+    const game = activeGames[gameId];
+    if (!game) {
+      socket.emit('error', 'Game not found');
+      return;
+    }
+
+    // الحصول على معرف اللاعب (يجب تخزينه عند الاتصال)
+    const playerId = getPlayerIdFromSocket(socket.id); // تحتاج لتنفيذ هذه الدالة
+    if (!playerId) {
+      socket.emit('error', 'Player not identified');
+      return;
+    }
+
+    const result = game.performCrime(playerId, crimeType);
+    
+    // إرسال النتيجة للاعب الحالي
+    socket.emit('crime-result', result);
+    
+    // إرسال التحديث للاعب الخصم
+    if (result.newState) {
+      const opponentId = Object.keys(game.players).find(id => id !== playerId);
+      const opponentSocket = getSocketIdFromPlayerId(opponentId); // تحتاج لتنفيذ هذه الدالة
+      if (opponentSocket) {
+        io.to(opponentSocket).emit('game-update', result.newState);
+      }
+    }
+  });
+
+  // إنهاء الدور
+  socket.on('end-turn', ({ gameId }) => {
+    const game = activeGames[gameId];
+    if (!game) {
+      socket.emit('error', 'Game not found');
+      return;
+    }
+
+    const playerId = getPlayerIdFromSocket(socket.id);
+    if (!playerId) {
+      socket.emit('error', 'Player not identified');
+      return;
+    }
+
+    const result = game.endTurn(playerId);
+    
+    if (result.success) {
+      // إرسال تحديث للاعب الجديد
+      const newTurnPlayerSocket = getSocketIdFromPlayerId(result.newTurn);
+      if (newTurnPlayerSocket) {
+        io.to(newTurnPlayerSocket).emit('turn-notification', {
+          message: 'إنه دورك الآن!',
+          state: result.state
+        });
+      }
+      
+      // إعلام اللاعب القديم
+      socket.emit('turn-ended', { message: result.message });
+    } else {
+      socket.emit('error', result.message);
+    }
+  });
+
+  // قطع الاتصال
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
+    // إزالة اللاعب من قائمة الانتظار إذا كان موجوداً
+    waitingPlayers = waitingPlayers.filter(p => p.socketId !== socket.id);
+    // TODO: التعامل مع انسحاب لاعب من مباراة نشطة
   });
 });
 
@@ -91,6 +214,18 @@ app.get('/api/profile', (req, res) => {
 
 // الصفحة الرئيسية
 app.get('/', (req, res) => res.send('The Underworld API'));
+
+// ========== دوال مساعدة (يجب تطويرها) ==========
+function getPlayerIdFromSocket(socketId) {
+  // TODO: ربط socketId بمعرف اللاعب
+  // يمكن استخدام Map أو تخزينه عند الاتصال
+  return null; // مؤقتاً
+}
+
+function getSocketIdFromPlayerId(playerId) {
+  // TODO: العثور على socketId من معرف اللاعب
+  return null; // مؤقتاً
+}
 
 // بدء الخادم
 const PORT = 3000;
