@@ -2,11 +2,14 @@
 // The-Underworld - Game Logic Engine
 // ============================================
 // هذا الملف يحتوي على القواعد الأساسية للعبة
-// سنقوم بتوسيعه تدريجياً ليشمل كل الميزات
+// تم دمج نظام العصابات بالكامل
 // ============================================
+
+const GangSystem = require('./gangSystem.js');
 
 class Game {
   constructor(player1Id, player2Id) {
+    this.gangSystem = new GangSystem(); // نظام العصابات
     this.players = {
       [player1Id]: this.createPlayer(player1Id),
       [player2Id]: this.createPlayer(player2Id)
@@ -14,6 +17,7 @@ class Game {
     this.turn = player1Id; // من يبدأ الدور
     this.phase = 'setup';   // مرحلة اللعبة (setup, main, battle, end)
     this.winner = null;
+    this.gameId = `game_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   }
 
   // إنشاء لاعب جديد
@@ -26,6 +30,7 @@ class Game {
         respect: 0          // النفوذ
       },
       gang: {
+        id: null,           // معرف العصابة (إذا كان عضوًا)
         name: '',           // اسم العصابة (يُختار لاحقاً)
         members: [],        // أعضاء العصابة
         territory: 0,       // الأراضي المسيطر عليها
@@ -42,7 +47,8 @@ class Game {
         crimes: 0,
         wins: 0,
         losses: 0
-      }
+      },
+      gangInvitations: []   // دعوات الانضمام للعصابات
     };
   }
 
@@ -52,9 +58,12 @@ class Game {
     return {
       success: true,
       message: 'بدأت اللعبة!',
+      gameId: this.gameId,
       state: this.getStateForPlayer(this.turn)
     };
   }
+
+  // ========== دوال الأنشطة الإجرامية ==========
 
   // تنفيذ نشاط إجرامي
   performCrime(playerId, crimeType) {
@@ -104,14 +113,24 @@ class Game {
       player.stats.crimes += 1;
       
       // زيادة المستوى إذا وصلت الخبرة حداً معيناً
-      if (player.stats.xp >= player.stats.level * 100) {
-        player.stats.level += 1;
-        player.stats.xp = 0;
+      this.checkLevelUp(player);
+
+      // إذا كان اللاعب في عصابة، ساهم في خزينة العصابة
+      if (player.gang.id) {
+        const gang = this.gangSystem.getGangInfo(player.gang.id);
+        if (gang) {
+          this.gangSystem.contributeToGang(
+            player.gang.id, 
+            playerId, 
+            Math.floor(crime.reward.money * 0.1), // 10% للعصابة
+            0
+          );
+        }
       }
 
       return {
         success: true,
-        message: `نجحت في ${crimeType}! حصلت على ${crime.reward.money}$ و ${crime.reward.xp} خبرة.`,
+        message: `نجحت في ${this.getCrimeArabicName(crimeType)}! حصلت على ${crime.reward.money}$ و ${crime.reward.xp} خبرة.`,
         newState: this.getStateForPlayer(playerId)
       };
     } else {
@@ -120,9 +139,13 @@ class Game {
       
       // احتمالية السجن
       if (Math.random() < crime.risk.jailRisk) {
+        // اللاعب يدخل السجن (لا يستطيع اللعب لدورتين)
+        player.jailed = true;
+        player.jailTurns = 2;
+        
         return {
           success: false,
-          message: `فشلت في ${crimeType} وألقي القبض عليك! خسرت سمعة.`,
+          message: `فشلت في ${this.getCrimeArabicName(crimeType)} وألقي القبض عليك! خسرت سمعة وستبقى في السجن دورتين.`,
           jailed: true,
           newState: this.getStateForPlayer(playerId)
         };
@@ -130,21 +153,160 @@ class Game {
 
       return {
         success: false,
-        message: `فشلت في ${crimeType}! خسرت سمعة.`,
+        message: `فشلت في ${this.getCrimeArabicName(crimeType)}! خسرت سمعة.`,
         newState: this.getStateForPlayer(playerId)
       };
     }
   }
+
+  // الحصول على الاسم العربي للنشاط
+  getCrimeArabicName(crimeType) {
+    const names = {
+      robbery: 'سرقة بنك',
+      smuggling: 'تهريب',
+      extortion: 'ابتزاز',
+      heist: 'سرقة كبرى'
+    };
+    return names[crimeType] || crimeType;
+  }
+
+  // التحقق من زيادة المستوى
+  checkLevelUp(player) {
+    while (player.stats.xp >= player.stats.level * 100) {
+      player.stats.level += 1;
+      player.stats.xp -= player.stats.level * 100;
+      // مكافأة رفع المستوى
+      player.resources.money += 200;
+      player.resources.reputation += 10;
+    }
+  }
+
+  // ========== دوال العصابات ==========
+
+  // إنشاء عصابة جديدة
+  createGang(playerId, gangName, playerName) {
+    const player = this.players[playerId];
+    if (!player) return { success: false, message: 'لاعب غير موجود' };
+
+    // التحقق من أن اللاعب ليس لديه عصابة
+    if (player.gang.id) {
+      return { success: false, message: 'أنت بالفعل عضو في عصابة أخرى' };
+    }
+
+    const result = this.gangSystem.createGang(playerId, gangName, playerName);
+    
+    if (result.success) {
+      // ربط العصابة باللاعب
+      player.gang.id = result.gang.id;
+      player.gang.name = result.gang.name;
+    }
+
+    return result;
+  }
+
+  // إرسال دعوة للانضمام إلى عصابة
+  sendGangInvitation(gangId, leaderId, targetPlayerId, targetPlayerName) {
+    const leader = this.players[leaderId];
+    const target = this.players[targetPlayerId];
+
+    if (!leader || !target) {
+      return { success: false, message: 'أحد اللاعبين غير موجود' };
+    }
+
+    // التحقق من أن المرسل هو قائد العصابة
+    const gang = this.gangSystem.getGangInfo(gangId);
+    if (!gang || gang.leader !== leaderId) {
+      return { success: false, message: 'فقط قائد العصابة يمكنه إرسال الدعوات' };
+    }
+
+    const result = this.gangSystem.sendInvitation(gangId, leaderId, targetPlayerId, targetPlayerName);
+    
+    if (result.success) {
+      // إضافة الدعوة للاعب المستهدف
+      target.gangInvitations.push(result.invitation);
+    }
+
+    return result;
+  }
+
+  // قبول دعوة انضمام
+  acceptGangInvitation(playerId, gangId) {
+    const player = this.players[playerId];
+    if (!player) return { success: false, message: 'لاعب غير موجود' };
+
+    // التحقق من وجود الدعوة
+    const invitation = player.gangInvitations.find(inv => inv.gangId === gangId);
+    if (!invitation) {
+      return { success: false, message: 'لا توجد دعوة بهذا المعرف' };
+    }
+
+    const result = this.gangSystem.acceptInvitation(playerId, gangId);
+    
+    if (result.success) {
+      // ربط العصابة باللاعب
+      player.gang.id = gangId;
+      player.gang.name = result.gang.name;
+      // إزالة الدعوة
+      player.gangInvitations = player.gangInvitations.filter(inv => inv.gangId !== gangId);
+    }
+
+    return result;
+  }
+
+  // المساهمة في خزينة العصابة
+  contributeToGang(playerId, amount) {
+    const player = this.players[playerId];
+    if (!player) return { success: false, message: 'لاعب غير موجود' };
+    if (!player.gang.id) return { success: false, message: 'أنت لست عضواً في أي عصابة' };
+    if (player.resources.money < amount) {
+      return { success: false, message: 'لا تملك هذا المبلغ' };
+    }
+
+    const result = this.gangSystem.contributeToGang(player.gang.id, playerId, amount, 0);
+    
+    if (result.success) {
+      player.resources.money -= amount;
+    }
+
+    return result;
+  }
+
+  // ========== دوال العقود (سيتم تطويرها لاحقاً) ==========
+
+  // إنشاء عقد جديد (مبدئي)
+  createContract(playerId, targetPlayerId, terms) {
+    // TODO: تطوير نظام العقود الكامل
+    return { success: false, message: 'قيد التطوير' };
+  }
+
+  // ========== دوال إنهاء الدور والتحقق من الفائز ==========
 
   // إنهاء الدور
   endTurn(playerId) {
     if (this.turn !== playerId) {
       return { success: false, message: 'ليس دورك' };
     }
+
+    // معالجة تأثيرات السجن
+    const currentPlayer = this.players[playerId];
+    if (currentPlayer.jailed) {
+      currentPlayer.jailTurns -= 1;
+      if (currentPlayer.jailTurns <= 0) {
+        currentPlayer.jailed = false;
+      }
+    }
     
     // تبديل الدور للاعب الآخر
     const opponentId = Object.keys(this.players).find(id => id !== playerId);
     this.turn = opponentId;
+
+    // تحديث وقت النشاط للعصابة
+    if (currentPlayer.gang.id) {
+      const gang = this.gangSystem.getGangInfo(currentPlayer.gang.id);
+      if (gang) {
+        gang.lastActive = new Date().toISOString();
+      }
+    }
     
     return {
       success: true,
@@ -154,34 +316,66 @@ class Game {
     };
   }
 
+  // التحقق من وجود فائز
+  checkWinner() {
+    // TODO: تطوير شروط الفوز
+    return null;
+  }
+
+  // ========== دوال الحصول على المعلومات ==========
+
   // الحصول على حالة اللعبة للاعب معين (ما يراه)
   getStateForPlayer(playerId) {
     const player = this.players[playerId];
     const opponentId = Object.keys(this.players).find(id => id !== playerId);
     const opponent = this.players[opponentId];
 
+    // الحصول على معلومات العصابة للاعب
+    let gangInfo = null;
+    if (player.gang.id) {
+      gangInfo = this.gangSystem.getGangStats(player.gang.id);
+    }
+
     return {
+      gameId: this.gameId,
       you: {
-        resources: player.resources,
-        gang: player.gang,
-        stats: player.stats,
-        activities: player.activities,
-        contracts: player.contracts
+        resources: { ...player.resources },
+        gang: {
+          id: player.gang.id,
+          name: player.gang.name,
+          territory: player.gang.territory,
+          stats: gangInfo
+        },
+        stats: { ...player.stats },
+        activities: [...player.activities],
+        contracts: [...player.contracts],
+        jailed: player.jailed || false,
+        jailTurns: player.jailTurns || 0,
+        invitations: [...player.gangInvitations]
       },
       opponent: {
-        resources: opponent.resources,
+        resources: {
+          money: opponent.resources.money,
+          reputation: opponent.resources.reputation
+        },
         gang: {
           name: opponent.gang.name,
           territory: opponent.gang.territory
         },
         stats: {
           level: opponent.stats.level
-        }
+        },
+        jailed: opponent.jailed || false
       },
       turn: this.turn,
       phase: this.phase,
       winner: this.winner
     };
+  }
+
+  // الحصول على معلومات عصابة معينة
+  getGangInfo(gangId) {
+    return this.gangSystem.getGangInfo(gangId);
   }
 }
 
