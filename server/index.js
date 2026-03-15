@@ -8,6 +8,7 @@ const Game = require('./utils/gameLogic.js');
 const GangSystem = require('./utils/gangSystem.js');
 const SmartContractSystem = require('./utils/smartContracts.js');
 const BlackMarket = require('./utils/blackMarket.js');
+const BattleSystem = require('./utils/battleSystem.js'); // ✅ إضافة نظام المعارك
 const db = require('./db.js');
 
 const app = express();
@@ -23,6 +24,7 @@ let activeGames = {};                   // الألعاب النشطة
 const gangSystem = new GangSystem();     // نظام العصابات (يعمل مع DB)
 const contractSystem = new SmartContractSystem(); // نظام العقود (يعمل مع DB)
 const blackMarket = new BlackMarket();   // نظام السوق السوداء
+const battleSystem = new BattleSystem(); // ✅ نظام المعارك
 
 // ========== ربط socketId بمعرف اللاعب ==========
 const socketToPlayer = new Map();
@@ -375,6 +377,45 @@ app.post('/api/market/sell', async (req, res) => {
 app.get('/api/market/inventory/:playerId', async (req, res) => {
   const inventory = await blackMarket.getPlayerInventory(req.params.playerId);
   res.json(inventory);
+});
+
+// ========== مسارات المعارك (Battle System) ==========
+
+// التحقق من إمكانية الهجوم
+app.post('/api/battle/can-attack', async (req, res) => {
+  const { attackerId, defenderId } = req.body;
+  const result = await battleSystem.canAttack(attackerId, defenderId);
+  res.json(result);
+});
+
+// تنفيذ هجوم
+app.post('/api/battle/attack', async (req, res) => {
+  const { attackerId, defenderId } = req.body;
+  const result = await battleSystem.attack(attackerId, defenderId);
+  res.json(result);
+});
+
+// استعادة نقاط الحياة
+app.post('/api/battle/heal', async (req, res) => {
+  const { playerId, amount } = req.body;
+  const result = await battleSystem.heal(playerId, amount);
+  res.json(result);
+});
+
+// الحصول على سجل معارك اللاعب
+app.get('/api/battle/history/:playerId', async (req, res) => {
+  const history = await battleSystem.getBattleHistory(req.params.playerId);
+  res.json(history);
+});
+
+// الحصول على حالة اللاعب (بما في ذلك HP)
+app.get('/api/battle/status/:playerId', async (req, res) => {
+  const status = await battleSystem.getPlayerStatus(req.params.playerId);
+  if (status) {
+    res.json(status);
+  } else {
+    res.status(404).json({ error: 'Player not found' });
+  }
 });
 
 // الصفحة الرئيسية
