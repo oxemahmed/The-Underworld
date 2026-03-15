@@ -7,7 +7,8 @@ const jwt = require('jsonwebtoken');
 const Game = require('./utils/gameLogic.js');
 const GangSystem = require('./utils/gangSystem.js');
 const SmartContractSystem = require('./utils/smartContracts.js');
-const db = require('./db.js'); // ✅ استيراد قاعدة البيانات
+const BlackMarket = require('./utils/blackMarket.js');
+const db = require('./db.js');
 
 const app = express();
 app.use(cors());
@@ -16,38 +17,31 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// ========== البيانات المؤقتة (تم استبدال players بقاعدة بيانات) ==========
-let waitingPlayers = [];         // قائمة اللاعبين المنتظرين (للبحث عن مباراة)
-let activeGames = {};            // الألعاب النشطة (gameId -> Game object)
-const gangSystem = new GangSystem(); // نظام العصابات
-const contractSystem = new SmartContractSystem(); // نظام العقود الذكية
+// ========== الأنظمة ==========
+let waitingPlayers = [];                // قائمة اللاعبين المنتظرين
+let activeGames = {};                   // الألعاب النشطة
+const gangSystem = new GangSystem();     // نظام العصابات (يعمل مع DB)
+const contractSystem = new SmartContractSystem(); // نظام العقود (يعمل مع DB)
+const blackMarket = new BlackMarket();   // نظام السوق السوداء
 
-// ========== إدارة ربط socketId بمعرف اللاعب ==========
-const socketToPlayer = new Map();   // socketId -> playerId
-const playerToSocket = new Map();   // playerId -> socketId
-
-// مفتاح سري (يُفضل وضعه في متغير بيئة)
+// ========== ربط socketId بمعرف اللاعب ==========
+const socketToPlayer = new Map();
+const playerToSocket = new Map();
 const SECRET_KEY = process.env.JWT_SECRET || 'your-secret-key-change-it';
 
-// ========== دوال مساعدة ==========
 function getPlayerIdFromSocket(socketId) {
   return socketToPlayer.get(socketId) || null;
 }
-
 function getSocketIdFromPlayerId(playerId) {
   return playerToSocket.get(playerId) || null;
 }
-
 function registerSocket(socketId, playerId) {
   socketToPlayer.set(socketId, playerId);
   playerToSocket.set(playerId, socketId);
 }
-
 function unregisterSocket(socketId) {
   const playerId = socketToPlayer.get(socketId);
-  if (playerId) {
-    playerToSocket.delete(playerId);
-  }
+  if (playerId) playerToSocket.delete(playerId);
   socketToPlayer.delete(socketId);
 }
 
@@ -55,7 +49,6 @@ function unregisterSocket(socketId) {
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
 
-  // تسجيل الدخول عبر WebSocket (بعد المصادقة عبر REST)
   socket.on('authenticate', ({ playerId, token }) => {
     try {
       const decoded = jwt.verify(token, SECRET_KEY);
@@ -71,7 +64,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // انضمام لاعب للبحث عن مباراة
   socket.on('join-game', async ({ playerId }) => {
     try {
       const result = await db.query('SELECT id, username FROM players WHERE id = $1', [playerId]);
@@ -81,24 +73,20 @@ io.on('connection', (socket) => {
       }
       const player = result.rows[0];
 
-      // إذا كان هناك لاعب منتظر
       if (waitingPlayers.length > 0) {
         const opponent = waitingPlayers.shift();
         const gameId = `game_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
 
-        // إنشاء غرفة للمباراة
         socket.join(gameId);
         const opponentSocket = getSocketIdFromPlayerId(opponent.playerId);
         if (opponentSocket) {
           io.sockets.sockets.get(opponentSocket)?.join(gameId);
         }
 
-        // إنشاء كائن اللعبة الجديد
         const game = new Game(playerId, opponent.playerId);
         game.startGame();
         activeGames[gameId] = game;
 
-        // إرسال بداية المباراة لكل لاعب
         io.to(opponentSocket).emit('game-start', {
           gameId,
           opponent: player.username,
@@ -115,12 +103,7 @@ io.on('connection', (socket) => {
 
         console.log(`Game started: ${playerId} vs ${opponent.playerId}`);
       } else {
-        // لا يوجد لاعب منتظر، نضيف هذا اللاعب إلى قائمة الانتظار
-        waitingPlayers.push({
-          socketId: socket.id,
-          playerId: playerId,
-          playerName: player.username
-        });
+        waitingPlayers.push({ socketId: socket.id, playerId, playerName: player.username });
         socket.emit('waiting', 'جاري البحث عن خصم...');
       }
     } catch (err) {
@@ -129,101 +112,59 @@ io.on('connection', (socket) => {
     }
   });
 
-  // تنفيذ نشاط إجرامي
   socket.on('perform-crime', ({ gameId, crimeType }) => {
     const game = activeGames[gameId];
-    if (!game) {
-      socket.emit('error', 'Game not found');
-      return;
-    }
-
+    if (!game) { socket.emit('error', 'Game not found'); return; }
     const playerId = getPlayerIdFromSocket(socket.id);
-    if (!playerId) {
-      socket.emit('error', 'Player not authenticated');
-      return;
-    }
-
+    if (!playerId) { socket.emit('error', 'Player not authenticated'); return; }
     const result = game.performCrime(playerId, crimeType);
-
-    // إرسال النتيجة للاعب الحالي
     socket.emit('crime-result', result);
-
-    // إرسال التحديث للاعب الخصم
     if (result.newState) {
       const opponentId = Object.keys(game.players).find(id => id !== playerId);
       const opponentSocket = getSocketIdFromPlayerId(opponentId);
-      if (opponentSocket) {
-        io.to(opponentSocket).emit('game-update', result.newState);
-      }
+      if (opponentSocket) io.to(opponentSocket).emit('game-update', result.newState);
     }
   });
 
-  // إنهاء الدور
   socket.on('end-turn', ({ gameId }) => {
     const game = activeGames[gameId];
-    if (!game) {
-      socket.emit('error', 'Game not found');
-      return;
-    }
-
+    if (!game) { socket.emit('error', 'Game not found'); return; }
     const playerId = getPlayerIdFromSocket(socket.id);
-    if (!playerId) {
-      socket.emit('error', 'Player not authenticated');
-      return;
-    }
-
+    if (!playerId) { socket.emit('error', 'Player not authenticated'); return; }
     const result = game.endTurn(playerId);
-
     if (result.success) {
-      // إرسال تحديث للاعب الجديد
       const newTurnPlayerSocket = getSocketIdFromPlayerId(result.newTurn);
       if (newTurnPlayerSocket) {
-        io.to(newTurnPlayerSocket).emit('turn-notification', {
-          message: 'إنه دورك الآن!',
-          state: result.state
-        });
+        io.to(newTurnPlayerSocket).emit('turn-notification', { message: 'إنه دورك الآن!', state: result.state });
       }
-
-      // إعلام اللاعب القديم
       socket.emit('turn-ended', { message: result.message });
     } else {
       socket.emit('error', result.message);
     }
   });
 
-  // قطع الاتصال
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
     waitingPlayers = waitingPlayers.filter(p => p.socketId !== socket.id);
     unregisterSocket(socket.id);
-    // TODO: التعامل مع انسحاب لاعب من مباراة نشطة
   });
 });
 
-// ========== مسارات API (REST) ==========
+// ========== مسارات API ==========
 
 // تسجيل حساب جديد
 app.post('/api/register', async (req, res) => {
   try {
     const { username, password } = req.body;
-
-    // التحقق من وجود المستخدم
     const existing = await db.query('SELECT id FROM players WHERE username = $1', [username]);
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ error: 'Username already exists' });
-    }
-
+    if (existing.rows.length > 0) return res.status(400).json({ error: 'Username already exists' });
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await db.query(
       'INSERT INTO players (username, password_hash, money, level, reputation) VALUES ($1, $2, 1000, 1, 0) RETURNING id, username, money, level',
       [username, hashedPassword]
     );
     const newPlayer = result.rows[0];
-
-    res.status(201).json({
-      message: 'Player created',
-      player: { id: newPlayer.id, username: newPlayer.username, money: newPlayer.money, level: newPlayer.level }
-    });
+    res.status(201).json({ message: 'Player created', player: newPlayer });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
@@ -235,36 +176,22 @@ app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     const result = await db.query('SELECT * FROM players WHERE username = $1', [username]);
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
     const player = result.rows[0];
     const valid = await bcrypt.compare(password, player.password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-
     const token = jwt.sign({ id: player.id, username: player.username }, SECRET_KEY);
-    res.json({
-      token,
-      player: {
-        id: player.id,
-        username: player.username,
-        money: player.money,
-        level: player.level,
-        reputation: player.reputation
-      }
-    });
+    res.json({ token, player: { id: player.id, username: player.username, money: player.money, level: player.level, reputation: player.reputation } });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// مسار محمي: الحصول على الملف الشخصي
+// الملف الشخصي
 app.get('/api/profile', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
-
   try {
     const decoded = jwt.verify(token, SECRET_KEY);
     const result = await db.query('SELECT id, username, money, level FROM players WHERE id = $1', [decoded.id]);
@@ -276,36 +203,31 @@ app.get('/api/profile', async (req, res) => {
 });
 
 // ========== مسارات العصابات (Gang System) ==========
-// ملاحظة: هذه المسارات لا تزال تستخدم gangSystem في الذاكرة.
-// لتخزين العصابات في قاعدة البيانات، يجب تعديل gangSystem.js نفسه.
-// سنقوم بذلك لاحقًا إذا أردت.
 
 // إنشاء عصابة جديدة
-app.post('/api/gangs/create', (req, res) => {
+app.post('/api/gangs/create', async (req, res) => {
   const { playerId, gangName, playerName } = req.body;
-  // ملاحظة: نحتاج للتحقق من وجود اللاعب في قاعدة البيانات
-  // لكن gangSystem لا يزال في الذاكرة. سنتركه كما هو الآن.
-  const result = gangSystem.createGang(playerId, gangName, playerName);
+  const result = await gangSystem.createGang(playerId, gangName, playerName);
   res.json(result);
 });
 
 // إرسال دعوة للانضمام إلى عصابة
-app.post('/api/gangs/invite', (req, res) => {
+app.post('/api/gangs/invite', async (req, res) => {
   const { gangId, leaderId, targetPlayerId, targetPlayerName } = req.body;
-  const result = gangSystem.sendInvitation(gangId, leaderId, targetPlayerId, targetPlayerName);
+  const result = await gangSystem.sendInvitation(gangId, leaderId, targetPlayerId, targetPlayerName);
   res.json(result);
 });
 
 // قبول دعوة
-app.post('/api/gangs/accept', (req, res) => {
+app.post('/api/gangs/accept', async (req, res) => {
   const { playerId, gangId } = req.body;
-  const result = gangSystem.acceptInvitation(playerId, gangId);
+  const result = await gangSystem.acceptInvitation(playerId, gangId);
   res.json(result);
 });
 
-// الحصول على معلومات عصابة اللاعب
-app.get('/api/gangs/player/:playerId', (req, res) => {
-  const gang = gangSystem.getPlayerGang(req.params.playerId);
+// معلومات عصابة اللاعب
+app.get('/api/gangs/player/:playerId', async (req, res) => {
+  const gang = await gangSystem.getPlayerGang(req.params.playerId);
   if (gang) {
     res.json({ success: true, gang });
   } else {
@@ -313,9 +235,9 @@ app.get('/api/gangs/player/:playerId', (req, res) => {
   }
 });
 
-// الحصول على معلومات عصابة محددة
-app.get('/api/gangs/:gangId', (req, res) => {
-  const gang = gangSystem.getGangInfo(req.params.gangId);
+// معلومات عصابة محددة
+app.get('/api/gangs/:gangId', async (req, res) => {
+  const gang = await gangSystem.getGangInfo(req.params.gangId);
   if (gang) {
     res.json({ success: true, gang });
   } else {
@@ -323,9 +245,9 @@ app.get('/api/gangs/:gangId', (req, res) => {
   }
 });
 
-// الحصول على إحصائيات عصابة
-app.get('/api/gangs/:gangId/stats', (req, res) => {
-  const stats = gangSystem.getGangStats(req.params.gangId);
+// إحصائيات عصابة
+app.get('/api/gangs/:gangId/stats', async (req, res) => {
+  const stats = await gangSystem.getGangStats(req.params.gangId);
   if (stats) {
     res.json({ success: true, stats });
   } else {
@@ -336,20 +258,13 @@ app.get('/api/gangs/:gangId/stats', (req, res) => {
 // المساهمة في خزينة العصابة
 app.post('/api/gangs/contribute', async (req, res) => {
   const { playerId, gangId, amount } = req.body;
-  // التحقق من رصيد اللاعب في قاعدة البيانات
   try {
     const playerRes = await db.query('SELECT money FROM players WHERE id = $1', [playerId]);
-    if (playerRes.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Player not found' });
-    }
-    const playerMoney = playerRes.rows[0].money;
-    if (playerMoney < amount) {
-      return res.json({ success: false, message: 'لا تملك هذا المبلغ' });
-    }
+    if (playerRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Player not found' });
+    if (playerRes.rows[0].money < amount) return res.json({ success: false, message: 'لا تملك هذا المبلغ' });
 
-    const result = gangSystem.contributeToGang(gangId, playerId, amount, 0);
+    const result = await gangSystem.contributeToGang(gangId, playerId, amount, 0);
     if (result.success) {
-      // خصم المبلغ من اللاعب في قاعدة البيانات
       await db.query('UPDATE players SET money = money - $1 WHERE id = $2', [amount, playerId]);
     }
     res.json(result);
@@ -359,26 +274,18 @@ app.post('/api/gangs/contribute', async (req, res) => {
   }
 });
 
-// ========== مسارات العقود الذكية (Smart Contracts) ==========
-// ملاحظة: هذه المسارات لا تزال تستخدم contractSystem في الذاكرة.
-// يمكن تعديلها لاحقًا لتستخدم قاعدة البيانات.
+// ========== مسارات العقود الذكية ==========
 
 // إنشاء عقد جديد
 app.post('/api/contracts/create', async (req, res) => {
   const { playerId, contractData } = req.body;
   try {
-    // التحقق من رصيد اللاعب للضمان
     if (contractData.escrowAmount) {
       const playerRes = await db.query('SELECT money FROM players WHERE id = $1', [playerId]);
-      if (playerRes.rows.length === 0) {
-        return res.status(404).json({ success: false, message: 'Player not found' });
-      }
-      if (playerRes.rows[0].money < contractData.escrowAmount) {
-        return res.json({ success: false, message: 'لا تملك المال الكافي للضمان' });
-      }
+      if (playerRes.rows.length === 0) return res.status(404).json({ success: false, message: 'Player not found' });
+      if (playerRes.rows[0].money < contractData.escrowAmount) return res.json({ success: false, message: 'لا تملك المال الكافي للضمان' });
     }
-
-    const result = contractSystem.createContract(playerId, contractData);
+    const result = await contractSystem.createContract(playerId, contractData);
     if (result.success && contractData.escrowAmount) {
       await db.query('UPDATE players SET money = money - $1 WHERE id = $2', [contractData.escrowAmount, playerId]);
     }
@@ -390,23 +297,23 @@ app.post('/api/contracts/create', async (req, res) => {
 });
 
 // قبول عقد
-app.post('/api/contracts/accept', (req, res) => {
+app.post('/api/contracts/accept', async (req, res) => {
   const { playerId, contractId } = req.body;
-  const result = contractSystem.acceptContract(contractId, playerId);
+  const result = await contractSystem.acceptContract(contractId, playerId);
   res.json(result);
 });
 
 // رفض عقد
-app.post('/api/contracts/reject', (req, res) => {
+app.post('/api/contracts/reject', async (req, res) => {
   const { playerId, contractId } = req.body;
-  const result = contractSystem.rejectContract(contractId, playerId);
+  const result = await contractSystem.rejectContract(contractId, playerId);
   res.json(result);
 });
 
-// تنفيذ عقد (إثبات)
+// تنفيذ عقد
 app.post('/api/contracts/execute', async (req, res) => {
   const { playerId, contractId, proof } = req.body;
-  const result = contractSystem.executeContract(contractId, playerId, proof);
+  const result = await contractSystem.executeContract(contractId, playerId, proof);
   if (result.success && result.reward) {
     await db.query('UPDATE players SET money = money + $1 WHERE id = $2', [result.reward, playerId]);
   }
@@ -416,31 +323,58 @@ app.post('/api/contracts/execute', async (req, res) => {
 // إلغاء عقد
 app.post('/api/contracts/cancel', async (req, res) => {
   const { playerId, contractId } = req.body;
-  const result = contractSystem.cancelContract(contractId, playerId);
+  const result = await contractSystem.cancelContract(contractId, playerId);
   if (result.success) {
-    const contract = contractSystem.getContract(contractId);
-    if (contract && contract.escrow.amount > 0 && contract.creator === playerId) {
-      await db.query('UPDATE players SET money = money + $1 WHERE id = $2', [contract.escrow.amount, playerId]);
+    const contract = await contractSystem.getContract(contractId);
+    if (contract && contract.escrow_amount > 0 && contract.creator_id === playerId) {
+      await db.query('UPDATE players SET money = money + $1 WHERE id = $2', [contract.escrow_amount, playerId]);
     }
   }
   res.json(result);
 });
 
-// الحصول على عقود لاعب معين
-app.get('/api/contracts/player/:playerId', (req, res) => {
+// الحصول على عقود لاعب
+app.get('/api/contracts/player/:playerId', async (req, res) => {
   const { filter } = req.query;
-  const contracts = contractSystem.getPlayerContracts(req.params.playerId, filter || 'all');
+  const contracts = await contractSystem.getPlayerContracts(req.params.playerId, filter || 'all');
   res.json(contracts);
 });
 
-// الحصول على تفاصيل عقد محدد
-app.get('/api/contracts/:contractId', (req, res) => {
-  const contract = contractSystem.getContract(req.params.contractId);
+// تفاصيل عقد
+app.get('/api/contracts/:contractId', async (req, res) => {
+  const contract = await contractSystem.getContract(req.params.contractId);
   if (contract) {
     res.json({ success: true, contract });
   } else {
     res.status(404).json({ success: false, message: 'Contract not found' });
   }
+});
+
+// ========== مسارات السوق السوداء ==========
+
+// جلب جميع العناصر المتاحة
+app.get('/api/market/items', (req, res) => {
+  res.json(blackMarket.getItems());
+});
+
+// شراء عنصر
+app.post('/api/market/buy', async (req, res) => {
+  const { playerId, itemId } = req.body;
+  const result = await blackMarket.buyItem(playerId, itemId);
+  res.json(result);
+});
+
+// بيع عنصر
+app.post('/api/market/sell', async (req, res) => {
+  const { playerId, itemId } = req.body;
+  const result = await blackMarket.sellItem(playerId, itemId);
+  res.json(result);
+});
+
+// الحصول على مخزون اللاعب
+app.get('/api/market/inventory/:playerId', async (req, res) => {
+  const inventory = await blackMarket.getPlayerInventory(req.params.playerId);
+  res.json(inventory);
 });
 
 // الصفحة الرئيسية
