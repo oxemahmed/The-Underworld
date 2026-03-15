@@ -21,6 +21,8 @@ const LoginScreen = ({ navigation }) => {
     }
 
     setLoading(true);
+    console.log('🔍 محاولة تسجيل الدخول:', username);
+
     try {
       const response = await fetch('http://localhost:3000/api/login', {
         method: 'POST',
@@ -28,18 +30,27 @@ const LoginScreen = ({ navigation }) => {
         body: JSON.stringify({ username, password })
       });
 
+      console.log('📡 حالة الاستجابة:', response.status);
       const data = await response.json();
+      console.log('📦 البيانات الواردة:', data);
 
       if (response.ok) {
-        navigation.replace('Game', {
-          userId: data.player.id,
-          username: data.player.username
-        });
+        // تأكد من وجود data.player
+        if (data.player && data.player.id) {
+          console.log('✅ تم تسجيل الدخول بنجاح، معرف اللاعب:', data.player.id);
+          navigation.replace('Game', {
+            userId: data.player.id,
+            username: data.player.username
+          });
+        } else {
+          Alert.alert('خطأ', 'استجابة غير صالحة من الخادم');
+        }
       } else {
         Alert.alert('خطأ', data.error || 'فشل تسجيل الدخول');
       }
     } catch (error) {
-      Alert.alert('خطأ', 'فشل الاتصال بالخادم');
+      console.error('❌ خطأ في الاتصال:', error);
+      Alert.alert('خطأ', 'فشل الاتصال بالخادم. تأكد من أن الخادم يعمل على localhost:3000');
     } finally {
       setLoading(false);
     }
