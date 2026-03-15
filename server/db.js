@@ -1,11 +1,12 @@
 const { Pool } = require('pg');
 
+const connectionString = 'postgresql://neondb_owner:npg_ZbFYi7RvVq5W@ep-lingering-bird-ab1zppu4-pooler.eu-west-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+
 const pool = new Pool({
-  user: 'postgres',          // اسم مستخدم قاعدة البيانات
-  host: 'localhost',         // عنوان الخادم
-  database: 'underworld_db', // اسم قاعدة البيانات
-  password: 'i2',            // كلمة المرور التي حددتها
-  port: 5432,                // منفذ PostgreSQL الافتراضي
+  connectionString: connectionString,
+  ssl: {
+    rejectUnauthorized: false // ضروري للاتصال عبر SSL
+  }
 });
 
 module.exports = {
